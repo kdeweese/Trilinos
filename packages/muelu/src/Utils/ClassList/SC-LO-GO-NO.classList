@@ -43,6 +43,7 @@ HierarchyManager
 HierarchyFactory
 HierarchyUtils
 Ifpack2Smoother - #if defined(HAVE_MUELU_TPETRA) && defined(HAVE_MUELU_IFPACK2)
+ImageBasedPFactory
 IndefBlockedDiagonalSmoother
 IntrepidPCoarsenFactory - #ifdef HAVE_MUELU_INTREPID2
 LineDetectionFactory

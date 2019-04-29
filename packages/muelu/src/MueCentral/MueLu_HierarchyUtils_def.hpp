@@ -126,6 +126,10 @@ namespace MueLu {
             level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
             //M->SetFactory(name, NoFactory::getRCP()); // TAW: generally it is a bad idea to overwrite the factory manager data here
           }
+	  else if(name== "Greyscale") {
+	    level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
+            level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
+	  }
           else if(name == "Node Comm") 
           {
             level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
@@ -187,7 +191,7 @@ namespace MueLu {
           const std::string& name = it2->first;
           TEUCHOS_TEST_FOR_EXCEPTION(name != "P" && name != "R"  && name != "K"  && name != "M" && name != "Mdiag" &&
                                      name != "Nullspace" && name != "Coordinates" && name != "pcoarsen: element to node map" && 
-                                     name != "Node Comm" &&
+                                     name != "Node Comm" && name!="Greyscale" &&
                                      !IsParamValidVariable(name), Exceptions::InvalidArgument,
                                      std::string("MueLu::Utils::AddNonSerializableDataToHierarchy: user data parameter list contains unknown data type (") + name + ")");
           if( name == "P" || name == "R" || name == "K" || name == "M") {
@@ -206,6 +210,11 @@ namespace MueLu {
             level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
             level->print(std::cout, MueLu::VERB_EXTREME);
           }
+	  else if(name == "Greyscale") {
+	    level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
+            level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
+            level->print(std::cout, MueLu::VERB_EXTREME);
+	  }
           else if(name == "Node Comm") {
             level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
             level->Set(name, Teuchos::getValue<RCP<const Teuchos::Comm<int> > >(it2->second), NoFactory::get());
