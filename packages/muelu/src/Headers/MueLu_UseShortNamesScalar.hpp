@@ -140,6 +140,9 @@ typedef MueLu::HierarchyUtils<Scalar,LocalOrdinal,GlobalOrdinal,Node> HierarchyU
 #ifdef MUELU_IFPACK2SMOOTHER_SHORT
 typedef MueLu::Ifpack2Smoother<Scalar,LocalOrdinal,GlobalOrdinal,Node> Ifpack2Smoother;
 #endif
+#ifdef MUELU_IMAGEBASEDPFACTORY_SHORT
+typedef MueLu::ImageBasedPFactory<Scalar,LocalOrdinal,GlobalOrdinal,Node> ImageBasedPFactory;
+#endif
 #ifdef MUELU_INDEFBLOCKEDDIAGONALSMOOTHER_SHORT
 typedef MueLu::IndefBlockedDiagonalSmoother<Scalar,LocalOrdinal,GlobalOrdinal,Node> IndefBlockedDiagonalSmoother;
 #endif

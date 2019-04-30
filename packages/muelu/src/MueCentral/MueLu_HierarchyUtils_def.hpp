@@ -69,8 +69,8 @@ namespace MueLu {
   // calling AddNewLevel as appropriate.
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
   void HierarchyUtils<Scalar, LocalOrdinal, GlobalOrdinal, Node>::AddNonSerializableDataToHierarchy(HierarchyManager& HM, Hierarchy& H, const ParameterList& paramList) {
-    typedef typename Xpetra::MultiVector<typename Teuchos::ScalarTraits<Scalar>::coordinateType,
-                                         LocalOrdinal, GlobalOrdinal, Node> realvaluedmultivector_type;
+    using realvaluedmultivector_type = typename Xpetra::MultiVector<typename Teuchos::ScalarTraits<Scalar>::coordinateType,
+                                                                    LocalOrdinal, GlobalOrdinal, Node>;
 
     for (ParameterList::ConstIterator it = paramList.begin(); it != paramList.end(); it++) {
       const std::string& levelName = it->first;
@@ -126,10 +126,6 @@ namespace MueLu {
             level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
             //M->SetFactory(name, NoFactory::getRCP()); // TAW: generally it is a bad idea to overwrite the factory manager data here
           }
-	  else if(name== "Greyscale") {
-	    level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
-            level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
-	  }
           else if(name == "Node Comm") 
           {
             level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
@@ -191,7 +187,7 @@ namespace MueLu {
           const std::string& name = it2->first;
           TEUCHOS_TEST_FOR_EXCEPTION(name != "P" && name != "R"  && name != "K"  && name != "M" && name != "Mdiag" &&
                                      name != "Nullspace" && name != "Coordinates" && name != "pcoarsen: element to node map" && 
-                                     name != "Node Comm" && name!="Greyscale" &&
+                                     name != "Node Comm" &&
                                      !IsParamValidVariable(name), Exceptions::InvalidArgument,
                                      std::string("MueLu::Utils::AddNonSerializableDataToHierarchy: user data parameter list contains unknown data type (") + name + ")");
           if( name == "P" || name == "R" || name == "K" || name == "M") {
@@ -210,11 +206,6 @@ namespace MueLu {
             level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
             level->print(std::cout, MueLu::VERB_EXTREME);
           }
-	  else if(name == "Greyscale") {
-	    level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
-            level->Set(name, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
-            level->print(std::cout, MueLu::VERB_EXTREME);
-	  }
           else if(name == "Node Comm") {
             level->AddKeepFlag(name,NoFactory::get(),MueLu::UserData);
             level->Set(name, Teuchos::getValue<RCP<const Teuchos::Comm<int> > >(it2->second), NoFactory::get());
@@ -241,6 +232,8 @@ namespace MueLu {
               level->Set(varName, Teuchos::getValue<RCP<MultiVector> >(it2->second), NoFactory::get());
             else if(typeName == "vector")
               level->Set(varName, Teuchos::getValue<RCP<Vector> >(it2->second), NoFactory::get());
+            else if(typeName == "realmultivector")
+              level->Set(varName, Teuchos::getValue<RCP<realvaluedmultivector_type> >(it2->second), NoFactory::get());
             else if(typeName == "map")
               level->Set(varName, Teuchos::getValue<RCP<Xpetra::Map<LocalOrdinal, GlobalOrdinal, Node> > >(it2->second), NoFactory::get());
             else if(typeName == "ordinalvector")
