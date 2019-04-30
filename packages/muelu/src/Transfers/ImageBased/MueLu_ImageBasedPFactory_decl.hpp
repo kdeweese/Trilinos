@@ -67,7 +67,7 @@ namespace MueLu{
   public:
 
     // Declare useful types
-    using real_type = typename Teuchos::ScalarTraits<SC>::magnitudeType;
+    using real_type = typename Teuchos::ScalarTraits<SC>::coordinateType;
     using realvaluedmultivector_type = Xpetra::MultiVector<real_type,LO,GO,Node>;
 
     //! @name Constructors/Destructors.
@@ -104,8 +104,8 @@ namespace MueLu{
 		      RCP<realvaluedmultivector_type>& greyscale,
 		      Array<LO> &lFineNodesPerDir,
                       const int numDimensions, RCP<Matrix>& P) const;
-    
-    Scalar GetBlendingParameter(const real_type pixelval, int method) const;
+
+    real_type GetBlendingParameter(const real_type pixelval, int method) const;
   }; // class ImageBasedPFactory
 
 } // namespace MueLu
