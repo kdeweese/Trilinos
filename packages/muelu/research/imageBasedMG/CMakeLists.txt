@@ -23,9 +23,17 @@ IF (${PACKAGE_NAME}_ENABLE_Tpetra AND ${PACKAGE_NAME}_ENABLE_Belos AND ${PACKAGE
     NUM_MPI_PROCS 1
     )
 
+  TRIBITS_ADD_TEST(
+    ImageBased
+    NAME "ImageBased_smoothed_Laplace2D"
+    ARGS "--linAlgebra=Tpetra --xml=image_based_smoothed.xml --matrixType=Laplace2D --nx=10 --ny=10 --greyscale=auto"
+    COMM serial mpi
+    NUM_MPI_PROCS 1
+    )
+
 
   TRIBITS_COPY_FILES_TO_BINARY_DIR(ImageBased_cp
-    SOURCE_FILES image_based.xml
+    SOURCE_FILES image_based.xml image_based_smoothed.xml
     )
 
 
