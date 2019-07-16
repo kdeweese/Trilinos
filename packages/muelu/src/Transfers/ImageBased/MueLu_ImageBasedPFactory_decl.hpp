@@ -99,13 +99,18 @@ namespace MueLu{
 
   private:
     void BuildImageP(RCP<Matrix>& A, RCP<const CrsGraph>& prolongatorGraph,
-                      RCP<realvaluedmultivector_type>& fineCoordinates,
-                      RCP<realvaluedmultivector_type>& ghostCoordinates,
+		      RCP<realvaluedmultivector_type>& fineCoordinates,
+		      RCP<realvaluedmultivector_type>& ghostCoordinates,
 		      RCP<realvaluedmultivector_type>& greyscale,
+		      RCP<realvaluedmultivector_type>& coarseGreyscale,
 		      Array<LO> &lFineNodesPerDir,
-                      const int numDimensions, RCP<Matrix>& P) const;
+		      const int numDimensions, RCP<Matrix>& P,
+		      const real_type K1, const real_type K2,
+		      const int method, const real_type threshold) const; 
 
-    real_type GetBlendingParameter(const real_type pixelval, int method) const;
+    real_type GetBlendingParameter(const real_type pixelval, const int method,
+				   const real_type threshold) const;
+
   }; // class ImageBasedPFactory
 
 } // namespace MueLu
