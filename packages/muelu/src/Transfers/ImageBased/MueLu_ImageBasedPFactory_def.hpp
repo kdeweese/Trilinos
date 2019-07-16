@@ -62,7 +62,7 @@ namespace MueLu {
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
   RCP<const ParameterList> ImageBasedPFactory<Scalar, LocalOrdinal, GlobalOrdinal, Node>::GetValidParameterList() const {
     RCP<ParameterList> validParamList = rcp(new ParameterList());
-
+    
     // general variables needed in ImageBasedPFactory
     validParamList->set<RCP<const FactoryBase> >("A",                       Teuchos::null,
                                                  "Generating factory of the matrix A");
@@ -73,7 +73,7 @@ namespace MueLu {
     validParamList->set<RCP<const FactoryBase> >("Coordinates",                  Teuchos::null,
                                                  "Fine level coordinates used to construct piece-wise linear prolongator and coarse level coordinates.");
     validParamList->set<RCP<const FactoryBase> >("Greyscale",                    Teuchos::null,
-                                                 "Greyscale pixel information.");
+						 "Greyscale pixel information.");
     validParamList->set<RCP<const FactoryBase> >("coarseCoordinatesFineMap",     Teuchos::null,
                                                  "map of the coarse coordinates' GIDs as indexed on the fine mesh.");
     validParamList->set<RCP<const FactoryBase> >("coarseCoordinatesMap",         Teuchos::null,
@@ -88,6 +88,9 @@ namespace MueLu {
                                                  "Number of nodes per spatial dimension on the fine grid.");
     validParamList->set<bool>                   ("image_based: build coarse coordinates", false,
                                                  "flag for the computation of coarse coordinates by imageBasedPFactory");
+    /*validParamList->set<RCP<const FactoryBase> >("imageBias",                    Teuchos::null,
+      "Image coarsening self pixel bias.");*/
+    
     return validParamList;
   }
 
@@ -101,7 +104,8 @@ namespace MueLu {
     Input(fineLevel, "numDimensions");
     Input(fineLevel, "prolongatorGraph");
     Input(fineLevel, "lCoarseNodesPerDim");
-
+    Input(fineLevel, "lNodesPerDim");
+    
     if( pL.get<bool>("image_based: build coarse coordinates") ) {
       Input(fineLevel, "Coordinates");
       Input(fineLevel, "coarseCoordinatesFineMap");
@@ -110,6 +114,14 @@ namespace MueLu {
 
     // Request the local number of nodes per dimensions
     if(fineLevel.GetLevelID() == 0) {
+      /*if(fineLevel.IsAvailable("imageBias", NoFactory::get())) {
+	  fineLevel.DeclareInput("imageBias", NoFactory::get(), this);
+	}
+	else {
+	  TEUCHOS_TEST_FOR_EXCEPTION(fineLevel.IsAvailable("imageBias", NoFactory::get()),
+				   Exceptions::RuntimeError,
+				   "imageBias was not provided by the user on level0!");
+				   }*/
       if(fineLevel.IsAvailable("Greyscale", NoFactory::get())) {
         fineLevel.DeclareInput("Greyscale", NoFactory::get(), this);
       } else {
@@ -118,7 +130,9 @@ namespace MueLu {
                                    "Greyscale was not provided by the user on level0!");
       }
     } else {
+      //Input(fineLevel, "imageBias");
       Input(fineLevel, "Greyscale");
+      //fineLevel.DeclareInput("Greyscale", NoFactory::get(), this);
     }
 
   }
@@ -150,6 +164,18 @@ namespace MueLu {
     const bool buildCoarseCoordinates = pL.get<bool>("image_based: build coarse coordinates");
     const int numDimensions           = Get<int>(fineLevel, "numDimensions");
 
+    // TODO these should all be user modified
+    real_type K1 = Teuchos::ScalarTraits<real_type>::one();
+    real_type K2 = 10000*K1;
+    real_type imageBias = 1000;
+    real_type threshold = 81;
+    int method = 1;
+    /*if(fineLevel.GetLevelID() == 0) {
+      imageBias = fineLevel.Get<real_type>("imageBias", NoFactory::get());
+    } else {
+      imageBias = Get<real_type>(fineLevel, "imageBias");
+      }*/
+    
     // Declared main input/outputs to be retrieved and placed on the fine resp. coarse level
     RCP<Matrix> A = Get<RCP<Matrix> >(fineLevel, "A");
     RCP<const CrsGraph> prolongatorGraph = Get<RCP<CrsGraph> >(fineLevel, "prolongatorGraph");
@@ -159,9 +185,10 @@ namespace MueLu {
 
     *out << "ImageBasedPFactory::BuildP: load the greyscale" << std::endl;
 
-    fineLevel.print(*out, (MueLu::Extreme | 0x02000000));
-
-    RCP<realvaluedmultivector_type> greyscale;
+    //fineLevel.print(*out, (MueLu::Extreme | 0x02000000));
+    Array<real_type> greyscale_dist(256, 0);
+    
+    RCP<realvaluedmultivector_type> greyscale, coarseGreyscale;
     if(fineLevel.GetLevelID() == 0) {
       greyscale = fineLevel.Get<RCP<realvaluedmultivector_type> >("Greyscale", NoFactory::get());
     } else {
@@ -186,8 +213,15 @@ namespace MueLu {
     }
 
     *out << "Fine and coarse coordinates have been loaded from the fine level and set on the coarse level." << std::endl;
+    RCP<const Map> coarseGreyscaleMap = Get< RCP<const Map> >(fineLevel, "coarseCoordinatesMap");
+    coarseGreyscale = Xpetra::MultiVectorFactory<real_type,LO,GO,Node>::Build(coarseGreyscaleMap,
+									      greyscale->getNumVectors());
+    
+    //coarseGreyscale->describe(*out, Teuchos::VERB_EXTREME);
+    //RCP<realvaluedmultivector_type> weightTable =
+    //Xpetra::MultiVectorFactory<real_type,LO,GO,Node>::Build(coarseGreyscaleMap, 1);
 
-
+    
     // Compute the prolongator using piece-wise linear interpolation
     // First get all the required coordinates to compute the local part of P
     RCP<realvaluedmultivector_type> ghostCoordinates
@@ -196,15 +230,17 @@ namespace MueLu {
     RCP<const Import> ghostImporter = ImportFactory::Build(coarseCoordinates->getMap(),
 							   prolongatorGraph->getColMap());
     ghostCoordinates->doImport(*coarseCoordinates, *ghostImporter, Xpetra::INSERT);
-
+    std::cout << "finished ghost coordinates" << std::endl;
     {
       SubFactoryMonitor sfm(*this, "BuildImageP", coarseLevel);
-      BuildImageP(A, prolongatorGraph, fineCoordinates, ghostCoordinates, greyscale, lFineNodesPerDir, numDimensions, P);
+      BuildImageP(A, prolongatorGraph, fineCoordinates, ghostCoordinates,
+		  greyscale, coarseGreyscale, lFineNodesPerDir, numDimensions,
+		  P, K1, K2, method, threshold);
     }
 
 
     *out << "The prolongator matrix has been built." << std::endl;
-
+    //coarseGreyscale->describe(*out, Teuchos::VERB_EXTREME);
     {
       SubFactoryMonitor sfm(*this, "BuildNullspace", coarseLevel);
       // Build the coarse nullspace
@@ -222,10 +258,123 @@ namespace MueLu {
 
     Array<LO> lNodesPerDir = Get<Array<LO> >(fineLevel, "lCoarseNodesPerDim");
 
+    ArrayRCP<const real_type> grey(greyscale->getData(0));
+    real_type sum = 0;
+    for(auto it = grey.begin(); it != grey.end(); ++it) {
+      greyscale_dist[(int)(*it)]++;
+      sum += 1;
+    }
+    for(auto it = grey.begin(); it != grey.end(); ++it) {
+      greyscale_dist[(int)(*it)] /= sum;
+      if(numDimensions == 2) {
+	greyscale_dist[(int)(*it)] =
+	  round(greyscale_dist[(int)(*it)]
+		* (lNodesPerDir[0] - 1) * (lNodesPerDir[1] - 1));
+      }
+      else if(numDimensions == 3) {
+	greyscale_dist[(int)(*it)] =
+	  round(greyscale_dist[(int)(*it)] * (lNodesPerDir[0] - 1)
+		* (lNodesPerDir[1] - 1) * (lNodesPerDir[2] - 1));
+
+      }
+    }
+    
+
+    //Set(coarseLevel, "imageBias", imageBias);
     Set(coarseLevel, "numDimensions", numDimensions);
     Set(coarseLevel, "lNodesPerDim", lNodesPerDir);
     Set(coarseLevel, "P", P);
 
+    ArrayRCP<real_type> coarseGrey(coarseGreyscale->getDataNonConst(0));
+    std::vector<std::pair<real_type,LO> > weightTable(coarseGreyscale->getGlobalLength());
+    *out << "globalLength " << coarseGreyscale->getGlobalLength() << std::endl;
+    if(numDimensions == 2) {
+      for(LO j = 0; j < lNodesPerDir[1]; ++j) {
+	for(LO i = 0; i < lNodesPerDir[0]; ++i) {
+	  size_t idx = j*lNodesPerDir[0] + i;
+	  double temp = 0;
+	  size_t count = 0;
+
+	  for(LO a = i-1; a <= i+1; ++a) {
+	    for(LO b = j-1; b <= j+1; ++b) {
+	      if(a >= 0 && a < lNodesPerDir[0] && b >= 0 && b < lNodesPerDir[1]) {
+		
+		temp += coarseGrey[b*lNodesPerDir[0] + a];
+		count++;
+	      }
+	    }
+	  }
+	  if(count == 0)
+	    weightTable[idx] = std::make_pair(0, idx);
+	  else
+	    weightTable[idx] = std::make_pair((temp/count + 1000*coarseGrey[idx]), idx);	  
+	}
+      }
+    }
+
+    else if(numDimensions == 3) {
+      for(LO k = 0; k < lNodesPerDir[2]; ++k) {
+	for(LO j = 0; j < lNodesPerDir[1]; ++j) {
+	  for(LO i = 0; i < lNodesPerDir[0]; ++i) {
+	    size_t idx = k*lNodesPerDir[1]*lNodesPerDir[0] + j*lNodesPerDir[0] + i;
+	    if (idx >= coarseGreyscale->getGlobalLength()) {
+	      *out << "idx " << idx << std::endl;
+	    }
+	    double temp = 0;
+	    size_t count = 0;
+	    
+	    for(LO a = i-1; a <= i+1; ++a) {
+	      for(LO b = j-1; b <= j+1; ++b) {
+		for(LO c = k-1; c <= k+1; ++c) {
+		  if(a >= 0 && a < lNodesPerDir[0] && b >= 0 &&
+		     b < lNodesPerDir[1] && c >= 0 && c < lNodesPerDir[2]) {
+		    if (c*lNodesPerDir[1]*lNodesPerDir[0] +
+			b*lNodesPerDir[0] + a >= coarseGreyscale->getGlobalLength()) {
+		      *out << "idx2 " << c*lNodesPerDir[1]*lNodesPerDir[0] +
+				       b*lNodesPerDir[0] + a << std::endl;
+	    }
+		    temp += coarseGrey[c*lNodesPerDir[1]*lNodesPerDir[0] +
+				       b*lNodesPerDir[0] + a];
+		    count++;
+		  }
+		}
+	      }
+	    }
+	    if(count == 0)
+	      weightTable[idx] = std::make_pair(0, idx);
+	    else
+	      weightTable[idx] = std::make_pair((temp/count + imageBias*coarseGrey[idx]), idx);	  
+	  }
+	}
+      }
+    }
+    
+    std::sort(weightTable.begin(), weightTable.end(),
+	      [](std::pair<real_type, LO> a, std::pair<real_type, LO> b)
+	      {return std::get<0>(b) < std::get<0>(a);});
+    
+
+    for(size_t i = 0; i < 256; ++i) {
+      size_t upper_bound = 0, lower_bound = 0;
+      
+      for(size_t j = 0; j <= i; j++) {
+	upper_bound += greyscale_dist[j];
+      }
+
+      lower_bound = upper_bound - greyscale_dist[i];
+
+      if(lower_bound <= upper_bound && upper_bound <= weightTable.size()) {
+	for(size_t j = lower_bound; j < upper_bound; ++j) {
+	  if (std::get<0>(weightTable[j]) >= coarseGreyscale->getGlobalLength()) {
+	    *out << "idx3 " << std::get<0>(weightTable[j]) << std::endl;
+	    }
+	  coarseGrey[std::get<0>(weightTable[j])] = i;
+	}
+      }
+    }
+    
+    Set(coarseLevel, "Greyscale", coarseGreyscale);
+    
     *out << "ImageBasedPFactory::BuildP has completed." << std::endl;
 
   } // BuildP
@@ -234,11 +383,14 @@ namespace MueLu {
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
   void ImageBasedPFactory<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
   BuildImageP(RCP<Matrix>& A, RCP<const CrsGraph>& prolongatorGraph,
-               RCP<realvaluedmultivector_type>& fineCoordinates,
-               RCP<realvaluedmultivector_type>& ghostCoordinates,
-	       RCP<realvaluedmultivector_type>& greyscale,
-	       Array<LO> &lFineNodesPerDim,
-               const int numDimensions, RCP<Matrix>& P) const {
+	      RCP<realvaluedmultivector_type>& fineCoordinates,
+	      RCP<realvaluedmultivector_type>& ghostCoordinates,
+	      RCP<realvaluedmultivector_type>& greyscale,
+	      RCP<realvaluedmultivector_type>& coarseGreyscale,
+	      Array<LO> &lFineNodesPerDim,
+	      const int numDimensions, RCP<Matrix>& P,
+	      const real_type K1, const real_type K2,
+	      const int method, const real_type threshold) const {
 
     // Set debug outputs based on environment variable
     RCP<Teuchos::FancyOStream> out;
@@ -252,12 +404,13 @@ namespace MueLu {
     *out << "Entering BuildLinearP" << std::endl;
     //prolongatorGraph->describe(*out, Teuchos::VERB_EXTREME);
     ArrayRCP<const real_type> grey(greyscale->getData(0));
+    ArrayRCP<real_type> coarseGrey(coarseGreyscale->getDataNonConst(0));
+    Array<size_t> contrib(coarseGrey.size());
     Array<real_type> pixels(grey.size());
     real_type alpha;
-    real_type K1 = Teuchos::ScalarTraits<real_type>::one();
-    real_type K2 = 100*K1;
+    
     for(size_t i=0; i < grey.size(); ++i) {
-      alpha=GetBlendingParameter(grey[i], 1);
+      alpha=GetBlendingParameter(grey[i], method, threshold);
       pixels[i]=(1.0-alpha)*K1+(alpha*K2);
     }
     // Extract coordinates for interpolation stencil calculations
@@ -295,7 +448,8 @@ namespace MueLu {
     P = rcp(new CrsMatrixWrap(prolongatorGraph, dummyList));
     RCP<CrsMatrix> PCrs = rcp_dynamic_cast<CrsMatrixWrap>(P)->getCrsMatrix();
     PCrs->resumeFill(); // The Epetra matrix is considered filled at this point.
-    std::cout << "numInterpolationPoints " << numInterpolationPoints << std::endl;
+    //std::cout << "numInterpolationPoints " << numInterpolationPoints << std::endl;
+    //std::cout << "numFineNodes " << numFineNodes << std::endl;
     LO interpolationNodeIdx = 0, rowIdx = 0;
     ArrayView<const LO> colIndices;
     Array<SC> values;
@@ -310,7 +464,12 @@ namespace MueLu {
           rowIdx = nodeIdx*dofsPerNode + dof;
           prolongatorGraph->getLocalRowView(rowIdx, colIndices);
           PCrs->replaceLocalValues(rowIdx, colIndices, values());
-        }
+	  if(dof == 0) {
+	    coarseGrey[colIndices[0]] += grey[nodeIdx];
+	    contrib[colIndices[0]] += 1;
+	  }
+	}
+	
       } else {
         // Extract the coordinates associated with the current node
         // and the neighboring coarse nodes
@@ -332,100 +491,993 @@ namespace MueLu {
 	    }
           }
         }
+	//std::cout << "nodeIdx " << nodeIdx << std::endl;
 	values.resize(numInterpolationPoints);
-	real_type kappa_nw, kappa_ne, kappa_sw, kappa_se, s, w_N, w_S, w_E, w_W,
-	  w_NW, w_SE, w_SW, w_NE;
-	kappa_nw = nodeIdx % (lFineNodesPerDim)[0] == 0 ? 0 : pixels[nodeIdx-1];
-	kappa_ne = nodeIdx+1 % (lFineNodesPerDim)[0] == 0 ? 0 :  pixels[nodeIdx];
-	kappa_sw = (nodeIdx % (lFineNodesPerDim)[0] == 0) || (nodeIdx < (lFineNodesPerDim)[0]) ? 0 : pixels[nodeIdx-(lFineNodesPerDim)[0]-1];
-	kappa_se = nodeIdx < (lFineNodesPerDim)[0] ? 0 : pixels[nodeIdx-(lFineNodesPerDim)[0]];
-	s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
-	if(match[0]==2) {
-	  w_N = (kappa_nw + kappa_ne)/s;
-	  w_S = (kappa_sw + kappa_se)/s;
-	  if(nodeIdx-1 % lFineNodesPerDim[0]==0) {
-	    values[0]=0;
-	    values[1]=w_S;
-	    values[2]=0;
-	    values[3]=w_N;
+	const real_type RT_ZERO = Teuchos::ScalarTraits<real_type>::zero();
+	if(numDimensions == 2) {
+	  real_type kappa_nw, kappa_ne, kappa_sw, kappa_se, s, w_N, w_S, w_E, w_W,
+	    w_NW, w_SE, w_SW, w_NE;
+	  kappa_nw = (nodeIdx >= numFineNodes - lFineNodesPerDim[0]) ||
+	    nodeIdx % lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx-1];
+	  kappa_ne = (nodeIdx >= numFineNodes - lFineNodesPerDim[0]) ||
+	    (nodeIdx + 1) % lFineNodesPerDim[0] == 0 ? 0 :  pixels[nodeIdx];
+	  kappa_sw = (nodeIdx % lFineNodesPerDim[0] == 0)
+	    || (nodeIdx < lFineNodesPerDim[0])
+	    ? 0 : pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	  kappa_se = (nodeIdx + 1) % lFineNodesPerDim[0] == 0 ||
+	    nodeIdx < lFineNodesPerDim[0] ? 0
+		      : pixels[nodeIdx - lFineNodesPerDim[0]];
+
+	  s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
+	  
+	  if(match[0] == 2) {
+	    //std::cout << "vertical" << std::endl;
+	    w_N = (kappa_nw + kappa_ne)/s;
+	    w_S = (kappa_sw + kappa_se)/s;
+	    //std::cout << nodeIdx+1 << " " << lFineNodesPerDim[0] << std::endl;
+
+	    if((nodeIdx + 1) % lFineNodesPerDim[0] != 0) {
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+	    }
+	    
+	    values[0] = RT_ZERO;
+	    values[1] = RT_ZERO;
+	    values[2] = RT_ZERO;
+	    values[3] = RT_ZERO;
+	    
+	    if((nodeIdx + 1) % lFineNodesPerDim[0] != 0 && nodeIdx % lFineNodesPerDim[0] != 0) {
+	      if(nodeIdx >= lFineNodesPerDim[0] * 2) {
+		values[0] = w_S;
+		
+	      }
+	      if(numFineNodes - nodeIdx > 2*lFineNodesPerDim[0]) {
+		values[2] = w_N;
+	      }
+	    }
+	    /*if((nodeIdx + 1) % lFineNodesPerDim[0] == 0) {
+	      std::cout << "here" << std::endl;
+	      values[0]=0;
+	      values[1]=w_S;
+	      values[2]=0;
+	      values[3]=w_N;
+	      }*/
+	    
+	  }
+	  else if(match[1] == 2) {
+	    //std::cout << "horizontal" << std::endl;
+	    w_W = (kappa_sw + kappa_nw)/s;
+	    w_E = (kappa_se + kappa_ne)/s;
+
+	    if(nodeIdx < numFineNodes - lFineNodesPerDim[0]) {
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+	    }
+	    
+	    values[0] = RT_ZERO;
+	    values[1] = RT_ZERO;
+	    values[2] = RT_ZERO;
+	    values[3] = RT_ZERO;
+	    
+	    if(nodeIdx >= lFineNodesPerDim[0] && nodeIdx < numFineNodes - lFineNodesPerDim[0]) {
+	      if(nodeIdx % lFineNodesPerDim[0] < lFineNodesPerDim[0] - 2) {
+		values[1] = w_E;
+	      }
+	      if(nodeIdx % lFineNodesPerDim[0] >= 2) {
+		values[0] = w_W;
+	      }
+	    }
+	    /*if(numFineNodes - nodeIdx <= lFineNodesPerDim[0]) {
+	      values[0]=0;
+	      values[1]=0;
+	      values[2]=w_W;
+	      values[3]=w_E;
+	      }*/	    
+	  }
+	  else if(match[0] == 0 && match[1] == 0) {
+	    real_type w_N_l = RT_ZERO, w_N_r = RT_ZERO, w_S_l = RT_ZERO,
+	      w_S_r = RT_ZERO, w_W_u = RT_ZERO, w_W_d = RT_ZERO, w_E_u = RT_ZERO,
+	      w_E_d = RT_ZERO;
+	    w_N = (kappa_nw + kappa_ne)/s;
+	    w_S = (kappa_sw + kappa_se)/s;
+	    w_W = (kappa_sw + kappa_nw)/s;
+	    w_E = (kappa_se + kappa_ne)/s;
+
+	    if(nodeIdx < numFineNodes - lFineNodesPerDim[0]
+	       && (nodeIdx + 1) % lFineNodesPerDim[0] != 0) {
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+	    }
+	    
+	    //s_i,j+1
+	    kappa_nw = pixels[nodeIdx - 1 + lFineNodesPerDim[0]];
+	    kappa_ne = pixels[nodeIdx + lFineNodesPerDim[0]];
+	    kappa_sw = pixels[nodeIdx - 1];
+	    kappa_se = pixels[nodeIdx];
+	    
+	    s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
+	    if(s != RT_ZERO) {
+	      w_W_u = (kappa_sw + kappa_nw)/s;
+	      w_E_u = (kappa_se + kappa_ne)/s;
+	    }
+	    
+	    //s_i-1,j
+	    kappa_nw = (nodeIdx - 1) % lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx-2];
+	    kappa_ne = pixels[nodeIdx - 1];
+	    kappa_sw = (nodeIdx - 1) % lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx - lFineNodesPerDim[0] - 2];
+	    kappa_se = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+
+	    s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
+	    if(s != RT_ZERO) {
+	      w_N_l = (kappa_nw + kappa_ne)/s;
+	      w_S_l = (kappa_sw + kappa_se)/s;
+	    }
+
+	    //s_i+1,j
+	    kappa_nw = pixels[nodeIdx];
+	    kappa_ne = pixels[nodeIdx + 1];
+	    kappa_sw = pixels[nodeIdx - lFineNodesPerDim[0]];
+	    kappa_se = pixels[nodeIdx - lFineNodesPerDim[0] + 1];
+
+	    s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
+	    if(s != RT_ZERO) {
+	      w_N_r = (kappa_nw + kappa_ne)/s;
+	      w_S_r = (kappa_sw + kappa_se)/s;
+	    }
+
+	    //s_i,j-1
+	    kappa_nw = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	    kappa_ne = pixels[nodeIdx - lFineNodesPerDim[0]];
+	    kappa_sw = (nodeIdx < 2*lFineNodesPerDim[0])
+	      ? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0] - 1];
+	    kappa_se = (nodeIdx < 2*lFineNodesPerDim[0])
+	      ? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0]];
+
+	    s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
+	    if(s != RT_ZERO) {
+	      w_W_d = (kappa_sw + kappa_nw)/s;
+	      w_E_d = (kappa_se + kappa_ne)/s;
+	    }
+	    
+	    w_NW = .5*(w_N * w_W_u + w_W * w_N_l);
+	    w_NE = .5*(w_E * w_N_r + w_N * w_E_u);
+	    w_SW = .5*(w_W * w_S_l + w_S * w_W_d);
+	    w_SE = .5*(w_S * w_E_d + w_E * w_S_r);
+	    
+	    
+	    values[0]=w_SW;
+	    values[1]=w_SE;
+	    values[2]=w_NW;
+	    values[3]=w_NE;
+
+	    if(nodeIdx > 2*lFineNodesPerDim[0]) {
+	      if(nodeIdx % lFineNodesPerDim[0] > 1) {
+		values[0] = w_SW;
+	      }
+	      if(nodeIdx % lFineNodesPerDim[0] < lFineNodesPerDim[0] - 2) {
+		values[1] = w_SE;
+	      }
+	    }
+	    if(numFineNodes - nodeIdx > 2*lFineNodesPerDim[0]) {
+	      if(nodeIdx % lFineNodesPerDim[0] > 1) {
+		values[2] = w_NW;
+	      }
+	      if(nodeIdx % lFineNodesPerDim[0] < lFineNodesPerDim[0] - 2) {
+		values[3] = w_NE;
+	      }
+	    }
 	  }
 	  else {
-	    values[0]=w_S;
-	    values[1]=0;
-	    values[2]=w_N;
-	    values[3]=0;
+	    std::cout << "warning" << std::endl;
 	  }
 	}
-	else if(match[1]==2) {
-	  w_W = (kappa_sw + kappa_nw)/s;
-	  w_E = (kappa_se + kappa_ne)/s;
+	else if(numDimensions == 3) {
+	  values[0] = RT_ZERO;
+	  values[1] = RT_ZERO;
+	  values[2] = RT_ZERO;
+	  values[3] = RT_ZERO;
+	  values[4] = RT_ZERO;
+	  values[5] = RT_ZERO;
+	  values[6] = RT_ZERO;
+	  values[7] = RT_ZERO;
+	  
+	  real_type kappa_lfd, kappa_lft, kappa_lbd, kappa_lbt, kappa_rfd,
+	    kappa_rft, kappa_rbd, kappa_rbt, s, w_l, w_r, w_f, w_b, w_t, w_d,
+	    w_ft, w_bt, w_fd, w_bd, w_rt, w_lt, w_rd, w_ld, w_rb, w_rf, w_lb,
+	    w_lf;
 
-	  if(numFineNodes - nodeIdx <= lFineNodesPerDim[0]) {
-	    values[0]=0;
-	    values[1]=0;
-	    values[2]=w_W;
-	    values[3]=w_E;
+	  size_t planesize = lFineNodesPerDim[0]*lFineNodesPerDim[1];
+	  kappa_lfd = (nodeIdx < planesize) ||
+	    (nodeIdx % planesize < lFineNodesPerDim[0]) ||
+	    (nodeIdx % planesize % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+
+	  kappa_lft = (nodeIdx >= numFineNodes - planesize) ||
+	    (nodeIdx % planesize < lFineNodesPerDim[0]) ||
+	    (nodeIdx % planesize % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+
+	  kappa_lbd = (nodeIdx < planesize) ||
+	    (planesize - (nodeIdx % planesize) <= lFineNodesPerDim[0]) ||
+	    (nodeIdx % planesize % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - planesize - 1];
+
+	  kappa_lbt = (nodeIdx >= numFineNodes - planesize) ||
+	    (planesize - (nodeIdx % planesize) <= lFineNodesPerDim[0]) ||
+	    (nodeIdx % planesize % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - 1];
+	  
+	  kappa_rfd = (nodeIdx < planesize) ||
+	    (nodeIdx % planesize < lFineNodesPerDim[0]) ||
+	    ((nodeIdx % planesize + 1) % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+
+	  kappa_rft = (nodeIdx >= numFineNodes - planesize) ||
+	    (nodeIdx % planesize < lFineNodesPerDim[0]) ||
+	    ((nodeIdx % planesize + 1) % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - lFineNodesPerDim[0]];
+
+	  kappa_rbd = (nodeIdx < planesize) ||
+	    (planesize - (nodeIdx % planesize) <= lFineNodesPerDim[0]) ||
+	    ((nodeIdx % planesize + 1) % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx - planesize];
+
+	  kappa_rbt = (nodeIdx >= numFineNodes - planesize) ||
+	    (planesize - (nodeIdx % planesize) <= lFineNodesPerDim[0]) ||
+	    ((nodeIdx % planesize + 1) % lFineNodesPerDim[0] == 0)
+	    ? 0 : pixels[nodeIdx];
+	  
+	  s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	    + kappa_rft + kappa_rbd + kappa_rbt;
+	  //*out << "match[0] " << match[0] << " match[1] " << match[1] << " match[2] " << match[2] << std::endl; 
+	  if(match[1] == 4 && match[2] == 4) {
+	    //line in x-dim
+	    //*out << "x-dim line" << std::endl;
+
+	    if(planesize - (nodeIdx % planesize) > lFineNodesPerDim[0] &&
+	       nodeIdx < numFineNodes - planesize) {
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+	    }
+	    
+	    w_l = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+	    w_r = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+
+	    if(nodeIdx < numFineNodes - planesize) {
+	      if((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0) {
+		values[1] = w_r;
+	      }
+	      else if((nodeIdx % planesize + 2) % lFineNodesPerDim[0] == 0) {
+		values[0] = w_l;
+	      }
+	      else if((nodeIdx % planesize) >= lFineNodesPerDim[0] &&
+		      planesize - (nodeIdx % planesize) > lFineNodesPerDim[0]) {
+		values[0] = w_l;
+		values[1] = w_r;
+	      }
+	    }
+	    else {
+	      if((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0) {
+		values[5] = w_r;
+	      }
+	      else if((nodeIdx % planesize + 2) % lFineNodesPerDim[0] == 0) {
+		values[4] = w_l;
+	      }
+	      else if((nodeIdx % planesize) >= lFineNodesPerDim[0] &&
+		      planesize - (nodeIdx % planesize) > lFineNodesPerDim[0]) {
+		values[4] = w_l;
+		values[5] = w_r;
+	      }
+	    }
 	  }
-	  else {
-	    values[0]=w_W;
-	    values[1]=w_E;
-	    values[2]=0;
-	    values[3]=0;
+	  else if(match[0] == 4 && match[2] == 4) {
+	    //line in y-dim
+	    //*out << "y-dim line" << std::endl;
+
+	    if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0 &&
+	       nodeIdx < numFineNodes - planesize) {
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+	    }
+	    
+	    w_f = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	    w_b = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+
+	    if(nodeIdx < numFineNodes - planesize) {
+	      if((nodeIdx % planesize) < 2*lFineNodesPerDim[0]) {
+		values[2] = w_b;
+	      }
+	      else if(planesize - (nodeIdx % planesize) <= 2*lFineNodesPerDim[0]) {
+		values[0] = w_f;
+	      }
+	      else if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0 &&
+		      (nodeIdx % planesize) % lFineNodesPerDim[0] != 0) {
+		values[0] = w_f;
+		values[2] = w_b;
+	      }
+	    }
+	    else {
+	      if((nodeIdx % planesize) < 2*lFineNodesPerDim[0]) {
+		values[6] = w_b;
+	      }
+	      else if(planesize - (nodeIdx % planesize) <= 2*lFineNodesPerDim[0]) {
+		values[4] = w_f;
+	      }
+	      else if((nodeIdx % planesize) + 1 % lFineNodesPerDim[0] != 0 &&
+		      (nodeIdx % planesize) % lFineNodesPerDim[0] != 0) {
+		values[4] = w_f;
+		values[6] = w_b;
+	      }
+	    }
 	  }
-	}
-	else if(match[0]==0 && match[1]==0) {
-	  real_type w_N_l, w_N_r, w_S_l, w_S_r, w_W_u, w_W_d, w_E_u, w_E_d;
-	  w_N = (kappa_nw + kappa_ne)/s;
-	  w_S = (kappa_sw + kappa_se)/s;
-	  w_W = (kappa_sw + kappa_nw)/s;
-	  w_E = (kappa_se + kappa_ne)/s;
+	  else if(match[0] == 4 && match[1] == 4) {
+	    //line in z-dim
+	    //*out << "z-dim line" << std::endl;
 
-	  //s_i,j+1
-	  kappa_nw = pixels[nodeIdx-1+lFineNodesPerDim[0]];
-	  kappa_ne = pixels[nodeIdx+lFineNodesPerDim[0]];
-	  kappa_sw = nodeIdx % (lFineNodesPerDim)[0] == 0 ? 0 : pixels[nodeIdx-1];
-	  kappa_se = pixels[nodeIdx];
-	  s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
-	  w_W_u = (kappa_sw + kappa_nw)/s;
-	  w_E_u = (kappa_se + kappa_ne)/s;
+	    if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0 &&
+	       planesize - (nodeIdx % planesize) > lFineNodesPerDim[0]) {
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+	    }
+	    
+	    w_t = (kappa_lft + kappa_rft + kappa_lbt + kappa_rbt) / s;
+	    w_d = (kappa_lfd + kappa_rfd + kappa_lbd + kappa_rbd) / s;
 
-	  //s_i-1,j
-	  kappa_nw = nodeIdx-1 % lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx-2];
-	  kappa_ne = pixels[nodeIdx-1];
-	  kappa_sw = nodeIdx-1 & lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx-lFineNodesPerDim[0]-2];
-	  kappa_se = pixels[nodeIdx-lFineNodesPerDim[0]-1];
-	  s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
-	  w_N_l = (kappa_nw + kappa_ne)/s;
-	  w_S_l = (kappa_sw + kappa_se)/s;
+	    if(nodeIdx < 2*planesize) {
+	      values[4] = w_t;
+	    }
+	    else if(numFineNodes - nodeIdx <= 2*planesize) {
+	      values[0] = w_d;
+	    }
+	    else if(lFineNodesPerDim[0] <= (nodeIdx % planesize) &&
+		    (nodeIdx % planesize) <= (planesize - lFineNodesPerDim[0]) &&
+		    nodeIdx % planesize % lFineNodesPerDim[0] != 0 &&
+		    (nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0) {
+	      values[0] = w_d;
+	      values[4] = w_t;
+	    }
+	  }
+	  else if(match[0] == 4 || match[1] == 4 || match[2] == 4 ||
+		  (match[0] == 0 && match[1] == 0 && match[2] == 0)) {
+	    real_type w_f_t = RT_ZERO, w_b_t = RT_ZERO,
+	      w_t_l = RT_ZERO, w_d_l = RT_ZERO, w_f_d = RT_ZERO,
+	      w_b_d = RT_ZERO, w_d_b = RT_ZERO, w_t_b = RT_ZERO,
+	      w_t_r = RT_ZERO, w_r_t = RT_ZERO, w_l_t = RT_ZERO,
+	      w_d_r = RT_ZERO, w_r_d = RT_ZERO, w_l_d = RT_ZERO,
+	      w_b_r = RT_ZERO, w_r_b = RT_ZERO, w_f_r = RT_ZERO,
+	      w_r_f = RT_ZERO, w_b_l = RT_ZERO, w_l_b = RT_ZERO,
+	      w_f_l = RT_ZERO, w_l_f = RT_ZERO, w_t_f = RT_ZERO,
+	      w_d_f = RT_ZERO;
+	    
+	    w_l = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+	    w_r = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+	    w_f = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	    w_b = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+	    w_t = (kappa_lft + kappa_rft + kappa_lbt + kappa_rbt) / s;
+	    w_d = (kappa_lfd + kappa_rfd + kappa_lbd + kappa_rbd) / s;
 
-	  //s_i+1,j
-	  kappa_nw = pixels[nodeIdx];
-	  kappa_ne = nodeIdx-1 % lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx+1];
-	  kappa_sw = pixels[nodeIdx-lFineNodesPerDim[0]];
-	  kappa_se = nodeIdx-1 % lFineNodesPerDim[0] == 0 ? 0 : pixels[nodeIdx-lFineNodesPerDim[0]+1];
-	  s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
-	  w_N_r = (kappa_nw + kappa_ne)/s;
-	  w_S_r = (kappa_sw + kappa_se)/s;
+	    if(match[0] == 4 || match[1] == 4 ||
+	       (match[0] == 0 && match[1] == 0 && match[2] == 0)) {
+	      //s_i,j,k+1
+	      kappa_lfd = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	      kappa_lft = pixels[nodeIdx + planesize - lFineNodesPerDim[0] - 1];
+	      kappa_lbd = pixels[nodeIdx - 1];
+	      kappa_lbt = pixels[nodeIdx + planesize - 1];
+	      kappa_rfd = pixels[nodeIdx - lFineNodesPerDim[0]];
+	      kappa_rft = pixels[nodeIdx + planesize - lFineNodesPerDim[0]];
+	      kappa_rbd = pixels[nodeIdx];
+	      kappa_rbt = pixels[nodeIdx + planesize];
+	      
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_f_t = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+		w_b_t = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_l_t = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+		w_r_t = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+	      }
 
-	  //s_i,j-1
-	  kappa_nw = pixels[nodeIdx-1];
-	  kappa_ne = pixels[nodeIdx];
-	  kappa_sw = pixels[nodeIdx-lFineNodesPerDim[0]-1];
-	  kappa_se = pixels[nodeIdx-lFineNodesPerDim[0]];
-	  s = kappa_nw + kappa_ne + kappa_sw + kappa_se;
-	  w_W_d = (kappa_sw + kappa_nw)/s;
-	  w_E_d = (kappa_se + kappa_ne)/s;
+	      //s_i,j,k-1
+	      kappa_lfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0] - 1];
+	      kappa_lft = pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+	      kappa_lbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - 1];
+	      kappa_lbt = pixels[nodeIdx - planesize - 1];
+	      kappa_rfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0]];
+	      kappa_rft = pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+	      kappa_rbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize];
+	      kappa_rbt = pixels[nodeIdx - planesize];
+	      
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_l_d = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+		w_r_d = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+		w_f_d = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+		w_b_d = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+	      }
+	      
+	    }
 
+	    if(match[0] == 4 || match[2] == 4 ||
+	       (match[0] == 0 && match[1] == 0 && match[2] == 0)) {
+	      //s_i,j-1,k
+	      kappa_lfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0] - 1];
+	      kappa_lft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0] - 1];
+	      kappa_lbd = pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+	      kappa_lbt = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	      kappa_rfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0]];
+	      kappa_rft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0]];
+	      kappa_rbd = pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+	      kappa_rbt = pixels[nodeIdx - lFineNodesPerDim[0]];
+	      
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_t_f = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_d_f = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+		w_r_f = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+		w_l_f = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+	      }
 
-	  w_NW = .5*(w_N * w_W_u + w_W * w_N_l);
-	  w_NE = .5*(w_E * w_N_r + w_N * w_E_u);
-	  w_SW = .5*(w_W * w_S_l + w_S * w_W_d);
-	  w_SE = .5*(w_S * w_E_d + w_E * w_S_r);
+	      //s_i,j+1,k
+	      kappa_lfd = pixels[nodeIdx - planesize - 1];
+	      kappa_lft = pixels[nodeIdx - 1];
+	      kappa_lbd = pixels[nodeIdx - planesize + lFineNodesPerDim[0] - 1];
+	      kappa_lbt = pixels[nodeIdx + lFineNodesPerDim[0] - 1];
+	      kappa_rfd = pixels[nodeIdx - planesize];
+	      kappa_rft = pixels[nodeIdx];
+	      kappa_rbd = pixels[nodeIdx - planesize + lFineNodesPerDim[0]];
+	      kappa_rbt = pixels[nodeIdx + lFineNodesPerDim[0]];
+	      
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_r_b = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+		w_l_b = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+		w_d_b = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+		w_t_b = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+	      }
+	      
+	    }
 
-	  values[0]=w_SW;
-	  values[1]=w_SE;
-	  values[2]=w_NW;
-	  values[3]=w_NE;
+	    if(match[1] == 4 || match[2] == 4 ||
+	       (match[0] == 0 && match[1] == 0 && match[2] == 0)) {
+	      //s_i+1,j,k
+	      kappa_lfd = pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+	      kappa_lft = pixels[nodeIdx - lFineNodesPerDim[0]];
+	      kappa_lbd = pixels[nodeIdx - planesize];
+	      kappa_lbt = pixels[nodeIdx];
+	      kappa_rfd = pixels[nodeIdx - planesize - lFineNodesPerDim[0] + 1];
+	      kappa_rft = pixels[nodeIdx - lFineNodesPerDim[0] + 1];
+	      kappa_rbd = pixels[nodeIdx - planesize + 1];
+	      kappa_rbt = pixels[nodeIdx + 1];
+	      
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_t_r = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_d_r = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+		w_b_r = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_f_r = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	      }
+
+	      //s_i-1,j,k
+	      kappa_lfd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 2];
+	      kappa_lft = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - lFineNodesPerDim[0] - 2];
+	      kappa_lbd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize - 2];
+	      kappa_lbt = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - 2];
+	      kappa_rfd = pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rft = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	      kappa_rbd = pixels[nodeIdx - planesize - 1];
+	      kappa_rbt = pixels[nodeIdx - 1];
+	      
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO){
+		w_d_l = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+		w_t_l = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_b_l = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_f_l = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	      }
+	      
+	    }
+
+	    if(match[0] == 4) {
+	      real_type w_ft, w_bt, w_fd, w_bd;	    
+	      //*out << "yz plane" << std::endl;
+
+	      if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0) {
+		coarseGrey[colIndices[0]] += grey[nodeIdx];
+		contrib[colIndices[0]] += 1;
+	      }
+	      
+	      w_ft = .5 * (w_t * w_f_t + w_f * w_t_f);
+	      w_bt = .5 * (w_t * w_b_t + w_b * w_t_b);
+	      w_fd = .5 * (w_d * w_f_d + w_f * w_d_f);
+	      w_bd = .5 * (w_d * w_b_d + w_b * w_d_b);
+
+	      if((nodeIdx % planesize) % lFineNodesPerDim[0] != 0 &&
+		 (nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0) {
+		if(nodeIdx >= 2*planesize) {
+		  if(planesize - (nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		    values[2] = w_bd;
+		  }
+		  if((nodeIdx % planesize) >= 2*lFineNodesPerDim[0]) {
+		    values[0] = w_fd;
+		  }
+		}
+		if(numFineNodes - nodeIdx >= 2*planesize) {
+		  if(planesize - (nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		    values[4] = w_bt;
+		  }
+		  if((nodeIdx % planesize) >= 2*lFineNodesPerDim[0]) {
+		    values[6] = w_ft;
+		  }
+		}
+	      }
+	
+	    }
+	    
+	    else if(match[1] == 4) {
+	      real_type w_rt, w_lt, w_rd, w_ld;
+	      //*out << "xz plane" << std::endl;
+
+	      if(planesize - (nodeIdx % planesize) > lFineNodesPerDim[0]) {
+		coarseGrey[colIndices[0]] += grey[nodeIdx];
+		contrib[colIndices[0]] += 1;
+	      }
+	       
+	      w_rt = .5 * (w_r * w_t_r + w_t + w_r_t);
+	      w_lt = .5 * (w_l * w_t_l + w_t * w_l_t);
+	      w_rd = .5 * (w_r * w_d_r + w_d * w_r_d);
+	      w_ld = .5 * (w_l * w_d_l + w_d * w_l_d);
+
+	      if((nodeIdx % planesize) > lFineNodesPerDim[0] &&
+		 planesize - (nodeIdx % planesize) > lFineNodesPerDim[0]) {
+		if(nodeIdx >= 2*planesize) {
+		  if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0) {
+		    values[1] = w_rd;
+		  }
+		  if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		    values[0] = w_ld;
+		  }
+		}
+		if(numFineNodes - nodeIdx >= 2*planesize) {
+		  if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0) {
+		    values[5] = w_rt;
+		  }
+		  if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		    values[4] = w_lt;
+		  }
+		}
+		
+	      }
+	    }
+	    else if(match[2] == 4) {
+	      real_type w_rb, w_rf, w_lb, w_lf; 
+	      //*out << "xy plane" << std::endl;
+
+	      if(nodeIdx < numFineNodes - planesize) {
+		coarseGrey[colIndices[0]] += grey[nodeIdx];
+		contrib[colIndices[0]] += 1;
+	      }
+	       
+	      w_rb = .5 * (w_r * w_b_r + w_b * w_r_b);
+	      w_rf = .5 * (w_r * w_f_r + w_f * w_r_f);
+	      w_lb = .5 * (w_l * w_b_l + w_b * w_l_b);
+	      w_lf = .5 * (w_l * w_f_l + w_f * w_l_f);
+
+	      if(nodeIdx >= planesize
+		 && numFineNodes - nodeIdx > planesize) {
+		if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] != 0) {
+		  if((nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		    values[1] = w_rf;
+		  }
+		  if(planesize - (nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		    values[3] = w_rb;
+		  }
+		}
+		if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		  if((nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		    values[0] = w_lf;
+		  }
+		  if(planesize - (nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		    values[2] = w_lb;
+		  }
+		}
+	      }
+	    }
+	    
+	    else if(match[0] == 0 && match[1] == 0 && match[2] == 0) {
+	      //*out << "center" << std::endl;
+	      real_type w_bt_r, w_rt_b, w_rb_t, w_bt_l, w_lt_b, w_lb_t, w_ft_r,
+		w_rt_f, w_rf_t, w_ft_l, w_lt_f, w_bd_r, w_rd_b, w_rb_d,
+		w_bd_l, w_ld_b, w_lb_d, w_fd_r, w_rd_f, w_rf_d, w_lf_t,
+		w_fd_l, w_ld_f, w_lf_d, w_rbt, w_lbt, w_rft, w_lft, w_rbd,
+		w_lbd, w_rfd, w_lfd, w_b_rt = RT_ZERO, w_f_rt = RT_ZERO,
+		w_t_rb = RT_ZERO, w_d_rb = RT_ZERO, w_r_bt = RT_ZERO,
+		w_l_bt = RT_ZERO, w_b_lt = RT_ZERO, w_f_lt = RT_ZERO,
+		w_t_lb = RT_ZERO, w_d_lb = RT_ZERO, w_t_lf = RT_ZERO,
+		w_d_lf = RT_ZERO, w_l_ft = RT_ZERO, w_r_ft = RT_ZERO,
+		w_t_rf = RT_ZERO, w_d_rf = RT_ZERO, w_b_rd = RT_ZERO,
+		w_f_rd = RT_ZERO, w_r_bd = RT_ZERO, w_l_bd = RT_ZERO,
+		w_b_ld = RT_ZERO, w_f_ld = RT_ZERO, w_r_fd = RT_ZERO,
+		w_l_fd = RT_ZERO;
+
+	      coarseGrey[colIndices[0]] += grey[nodeIdx];
+	      contrib[colIndices[0]] += 1;
+
+	      //s_i+1,j,k+1
+	      kappa_lfd = pixels[nodeIdx - lFineNodesPerDim[0]];
+	      kappa_lft = pixels[nodeIdx + planesize - lFineNodesPerDim[0]];
+	      kappa_lbd = pixels[nodeIdx];
+	      kappa_lbt = pixels[nodeIdx + planesize];
+	      kappa_rfd = pixels[nodeIdx - lFineNodesPerDim[0] + 1];
+	      kappa_rft = pixels[nodeIdx + planesize - lFineNodesPerDim[0] + 1];
+	      kappa_rbd = pixels[nodeIdx + 1];
+	      kappa_rbt = pixels[nodeIdx + planesize + 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_b_rt = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_f_rt = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	      }
+
+	      //s_i+1,j+1,k
+	      kappa_lfd = pixels[nodeIdx - planesize];
+	      kappa_lft = pixels[nodeIdx];
+	      kappa_lbd = pixels[nodeIdx - planesize + lFineNodesPerDim[0]];
+	      kappa_lbt = pixels[nodeIdx + lFineNodesPerDim[0]];
+	      kappa_rfd = pixels[nodeIdx - planesize + 1];
+	      kappa_rft = pixels[nodeIdx + 1];
+	      kappa_rbd = pixels[nodeIdx - planesize + lFineNodesPerDim[0] + 1];
+	      kappa_rbt = pixels[nodeIdx + lFineNodesPerDim[0] + 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_t_rb = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_d_rb = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+	      }
+
+	      //s_i,j+1,k+1
+	      kappa_lfd = pixels[nodeIdx - 1];
+	      kappa_lft = pixels[nodeIdx + planesize - 1];
+	      kappa_lbd = pixels[nodeIdx + lFineNodesPerDim[0] - 1];
+	      kappa_lbt = pixels[nodeIdx + planesize + lFineNodesPerDim[0] - 1];
+	      kappa_rfd = pixels[nodeIdx];
+	      kappa_rft = pixels[nodeIdx + planesize];
+	      kappa_rbd = pixels[nodeIdx + lFineNodesPerDim[0]];
+	      kappa_rbt = pixels[nodeIdx + planesize + lFineNodesPerDim[0]];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_r_bt = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+		w_l_bt = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+	      }
+
+	      //s_i-1,j,k+1
+	      kappa_lfd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - lFineNodesPerDim[0] - 2];
+	      kappa_lft = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx + planesize - lFineNodesPerDim[0] - 2];
+	      kappa_lbd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - 2];
+	      kappa_lbt = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx + planesize - 2];
+	      kappa_rfd = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	      kappa_rft = pixels[nodeIdx + planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rbd = pixels[nodeIdx - 1];
+	      kappa_rbt = pixels[nodeIdx + planesize - 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+		+ kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_b_lt = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_f_lt = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	      }
+
+	      //s_i-1,j+1,k
+	      kappa_lfd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize  - 2];
+	      kappa_lft = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - 2];
+	      kappa_lbd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize + lFineNodesPerDim[0] - 2];
+	      kappa_lbt = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx + lFineNodesPerDim[0] - 2];
+	      kappa_rfd = pixels[nodeIdx - planesize - 1];
+	      kappa_rft = pixels[nodeIdx - 1];
+	      kappa_rbd = pixels[nodeIdx - planesize + lFineNodesPerDim[0] - 1];
+	      kappa_rbt = pixels[nodeIdx + lFineNodesPerDim[0] - 1];
+
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_t_lb = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_d_lb = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+	      }
+
+	      //s_i-1,j-1,k
+	      kappa_lfd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		|| (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0] - 2];
+	      kappa_lft = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		|| (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0] - 2];
+	      kappa_lbd = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 2];
+	      kappa_lbt = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - lFineNodesPerDim[0] - 2];
+	      kappa_rfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0] - 1];
+	      kappa_rft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0] - 1];
+	      kappa_rbd = pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rbt = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_t_lf = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_d_lf = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+	      }
+
+	      //s_i,j-1,k+1
+	      kappa_lfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0] - 1];
+	      kappa_lft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx + planesize - 2*lFineNodesPerDim[0] - 1];
+	      kappa_lbd = pixels[nodeIdx - lFineNodesPerDim[0] - 1];
+	      kappa_lbt = pixels[nodeIdx + planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0]];
+	      kappa_rft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx + planesize - 2*lFineNodesPerDim[0]];
+	      kappa_rbd = pixels[nodeIdx - lFineNodesPerDim[0]];
+	      kappa_rbt = pixels[nodeIdx + planesize - lFineNodesPerDim[0]];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_l_ft = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+		w_r_ft = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+	      }
+
+	      //s_i+1,j-1,k
+	      kappa_lfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0]];
+	      kappa_lft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0]];
+	      kappa_lbd = pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+	      kappa_lbt = pixels[nodeIdx - lFineNodesPerDim[0]];
+	      kappa_rfd = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0] + 1];
+	      kappa_rft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*lFineNodesPerDim[0] + 1];
+	      kappa_rbd = pixels[nodeIdx - planesize - lFineNodesPerDim[0] + 1];
+	      kappa_rbt = pixels[nodeIdx - lFineNodesPerDim[0] + 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_t_rf = (kappa_lft + kappa_lbt + kappa_rft + kappa_rbt) / s;
+		w_d_rf = (kappa_lfd + kappa_lbd + kappa_rfd + kappa_rbd) / s;
+	      }
+
+	      //s_i+1,j,k-1
+	      kappa_lfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0]];
+	      kappa_lft = pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+	      kappa_lbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize];
+	      kappa_lbt = pixels[nodeIdx - planesize];
+	      kappa_rfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0] + 1];
+	      kappa_rft = pixels[nodeIdx - planesize - lFineNodesPerDim[0] + 1];
+	      kappa_rbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize + 1];
+	      kappa_rbt = pixels[nodeIdx - planesize + 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+	      
+	      if(s != RT_ZERO) {
+		w_b_rd = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_f_rd = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	      }
+
+	      //s_i,j+1,k-1
+	      kappa_lfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - 1];
+	      kappa_lft = pixels[nodeIdx - planesize - 1];
+	      kappa_lbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize
+				 + lFineNodesPerDim[0] - 1];
+	      kappa_lbt = pixels[nodeIdx - planesize + lFineNodesPerDim[0] - 1];
+	      kappa_rfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize];
+	      kappa_rft = pixels[nodeIdx - planesize];
+	      kappa_rbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize + lFineNodesPerDim[0]];
+	      kappa_rbt = pixels[nodeIdx - planesize + lFineNodesPerDim[0]];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_r_bd = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+		w_l_bd = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+	      }
+
+	      //s_i-1,j,k-1
+	      kappa_lfd = (nodeIdx < 2*planesize)
+		|| ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0] - 2];
+	      kappa_lft = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 2];
+	      kappa_lbd = (nodeIdx < 2*planesize)
+		|| ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - 2*planesize - 2];
+	      kappa_lbt = ((nodeIdx % planesize - 1) % lFineNodesPerDim[0] == 0)
+		? 0 : pixels[nodeIdx - planesize - 2];
+	      kappa_rfd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rft = pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - 1];
+	      kappa_rbt = pixels[nodeIdx - planesize - 1];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_b_ld = (kappa_lbd + kappa_lbt + kappa_rbd + kappa_rbt) / s;
+		w_f_ld = (kappa_lfd + kappa_lft + kappa_rfd + kappa_rft) / s;
+	      }
+
+	      //s_i,j-1,k-1
+	      kappa_lfd = (nodeIdx < 2*planesize)
+		|| (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*planesize - 2*lFineNodesPerDim[0] - 1];
+	      kappa_lft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0] - 1];
+	      kappa_lbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0] - 1];
+	      kappa_lbt = pixels[nodeIdx - planesize - lFineNodesPerDim[0] - 1];
+	      kappa_rfd = (nodeIdx < 2*planesize)
+		|| (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - 2*planesize - 2*lFineNodesPerDim[0]];
+	      kappa_rft = (nodeIdx % planesize < 2*lFineNodesPerDim[0])
+		? 0 : pixels[nodeIdx - planesize - 2*lFineNodesPerDim[0]];
+	      kappa_rbd = (nodeIdx < 2*planesize)
+		? 0 : pixels[nodeIdx - 2*planesize - lFineNodesPerDim[0]];
+	      kappa_rbt = pixels[nodeIdx - planesize - lFineNodesPerDim[0]];
+
+	  
+	      s = kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt + kappa_rfd
+	      + kappa_rft + kappa_rbd + kappa_rbt;
+
+	      if(s != RT_ZERO) {
+		w_r_fd = (kappa_rfd + kappa_rft + kappa_rbd + kappa_rbt) / s;
+		w_l_fd = (kappa_lfd + kappa_lft + kappa_lbd + kappa_lbt) / s;
+	      }
+	      
+	      
+	      w_bt_r = .5 * (w_t_r * w_b_rt + w_b_r * w_t_rb);
+	      w_rt_b = .5 * (w_r_b * w_t_rb + w_t_b * w_r_bt);
+	      w_rb_t = .5 * (w_r_t * w_b_rt + w_b_t * w_r_bt);
+	      w_bt_l = .5 * (w_t_l * w_b_lt + w_b_l * w_t_lb);
+	      w_lt_b = .5 * (w_l_b * w_t_lb + w_t_b * w_l_bt);
+	      w_lb_t = .5 * (w_l_t * w_b_lt + w_b_t * w_l_bt);
+	      w_ft_r = .5 * (w_t_r * w_f_rt + w_f_r * w_t_rf);
+	      w_rt_f = .5 * (w_r_f * w_t_rf + w_t_f * w_r_ft);
+	      w_rf_t = .5 * (w_r_t * w_f_rt + w_f_t * w_r_ft);
+	      w_ft_l = .5 * (w_t_l * w_f_lt + w_f_l * w_t_lf);
+	      w_lt_f = .5 * (w_l_f * w_t_lf + w_t_f * w_l_ft);
+	      w_lf_t = .5 * (w_l_t * w_f_lt + w_f_t * w_l_ft);
+	      w_bd_r = .5 * (w_d_r * w_b_rd + w_b_r * w_d_rb);
+	      w_rd_b = .5 * (w_r_b * w_d_rb + w_d_b * w_r_bd);
+	      w_rb_d = .5 * (w_r_d * w_b_rd + w_b_d * w_r_bd);
+	      w_bd_l = .5 * (w_d_l * w_b_ld + w_b_l * w_d_lb);
+	      w_ld_b = .5 * (w_l_b * w_d_lb + w_d_b * w_l_bd);
+	      w_lb_d = .5 * (w_l_d * w_b_ld + w_b_d * w_l_bd);
+	      w_fd_r = .5 * (w_d_r * w_f_rd + w_f_r * w_d_rf);
+	      w_rd_f = .5 * (w_r_f * w_d_rf + w_d_f * w_r_fd);
+	      w_rf_d = .5 * (w_r_d * w_f_rd + w_f_d * w_r_fd);
+	      w_fd_l = .5 * (w_d_l * w_f_ld + w_f_l * w_d_lf);
+	      w_ld_f = .5 * (w_l_f * w_d_lf + w_d_f * w_l_fd);
+	      w_lf_d = .5 * (w_l_d * w_f_ld + w_f_d * w_l_fd);
+
+	      w_rbt = 1/3. * (w_r * w_bt_r + w_b * w_rt_b + w_t * w_rb_t);
+	      w_lbt = 1/3. * (w_l * w_bt_l + w_b * w_lt_b + w_t * w_lb_t);
+	      w_rft = 1/3. * (w_r * w_ft_r + w_f * w_rt_f + w_t * w_rf_t);
+	      w_lft = 1/3. * (w_l * w_ft_l + w_f * w_lt_f + w_t * w_lf_t);
+	      w_rbd = 1/3. * (w_r * w_bd_r + w_b * w_rd_b + w_d * w_rb_d);
+	      w_lbd = 1/3. * (w_l * w_bd_l + w_b * w_ld_b + w_d * w_lb_d);
+	      w_rfd = 1/3. * (w_r * w_fd_r + w_f * w_rd_f + w_d * w_rf_d);
+	      w_lfd = 1/3. * (w_l * w_fd_l + w_f * w_ld_f + w_d * w_lf_d);
+
+	      if(nodeIdx > 2*planesize) {
+		if((nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		  if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		    values[0] = w_lfd;
+		  }
+		  if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] !=0) {
+		    values[1] = w_rfd;
+		  }
+		}
+		if(planesize - (nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		  if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		    values[2] = w_lbd;
+		  }
+		  if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] !=0) {
+		    values[3] = w_rbd;
+		  }
+		}
+	      }
+	      if(numFineNodes - nodeIdx >= 2*planesize) {
+		if((nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		  if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		    values[4] = w_lft;
+		  }
+		  if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] !=0) {
+		    values[5] = w_rft;
+		  }
+		}
+		if(planesize - (nodeIdx % planesize) > 2*lFineNodesPerDim[0]) {
+		  if(nodeIdx % planesize % lFineNodesPerDim[0] != 0) {
+		    values[6] = w_lbt;
+		  }
+		  if((nodeIdx % planesize + 1) % lFineNodesPerDim[0] !=0) {
+		    values[7] = w_rbt;
+		  }
+		}
+	      }
+	      
+	    }
+	  }
+	  else{
+	    std::cout << "warning" << std::endl;
+	  }
 	}
 	else {
 	  std::cout << "warning" << std::endl;
@@ -438,7 +1490,7 @@ namespace MueLu {
         for(LO valueIdx = 0; valueIdx < numInterpolationPoints; ++valueIdx) {
           values[valueIdx] = Teuchos::as<SC>(stencil[valueIdx]);
 	  }*/
-
+	//std::cout << "colIndices " << colIndices[0] << " " << colIndices[1] << " " << colIndices[2] << " " << colIndices[3] << " " << colIndices[4] << " " << colIndices[5] << " " << colIndices[6] << " " << colIndices[7] << std::endl;
         // Set values in all the rows corresponding to nodeIdx
         for(LO dof = 0; dof < dofsPerNode; ++dof) {
           rowIdx = nodeIdx*dofsPerNode + dof;
@@ -447,14 +1499,17 @@ namespace MueLu {
         }
       }
     }
-
+    for(size_t i = 0; i < coarseGrey.size(); ++i) {
+      coarseGrey[i] = round(coarseGrey[i] / (Teuchos::ScalarTraits<real_type>::one() * contrib[i]));
+    }
+    
     *out << "The calculation of the interpolation stencils has completed." << std::endl;
 
     PCrs->fillComplete();
-    std::cout << "PCrs" << std::endl;
-    PCrs->describe(*out,Teuchos::VERB_EXTREME);
+    //std::cout << "PCrs" << std::endl;
+    //PCrs->describe(*out,Teuchos::VERB_EXTREME);
     //Teuchos::RCP<const CrsMatrix> temp(PCrs);
-    Xpetra::IO<SC,LO,GO,Node>::Write("test.mtx", *P);
+    //Xpetra::IO<SC,LO,GO,Node>::Write("test.mtx", *P);
     *out << "All values in P have been set and expertStaticFillComplete has been performed." << std::endl;
 
     // set StridingInformation of P
@@ -468,13 +1523,12 @@ namespace MueLu {
 
 
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
-  typename Teuchos::ScalarTraits<Scalar>::coordinateType ImageBasedPFactory<Scalar, LocalOrdinal, GlobalOrdinal, Node>::GetBlendingParameter(const real_type pixelval, int method) const {
+  typename Teuchos::ScalarTraits<Scalar>::coordinateType ImageBasedPFactory<Scalar, LocalOrdinal, GlobalOrdinal, Node>::GetBlendingParameter(const real_type pixelval, const int method, const real_type thresh) const {
 
     // Usefull constants
     const real_type RT_ZERO = Teuchos::ScalarTraits<real_type>::zero();
     const real_type RT_ONE  = Teuchos::ScalarTraits<real_type>::one();
 
-    const real_type thresh=77;  // 04-30-19, LBV: Could probably be made constexpr?
     real_type alpha = RT_ZERO;
     if(method == 0) {        //Linear
       alpha = pixelval / 255.0;
